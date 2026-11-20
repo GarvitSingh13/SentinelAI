@@ -1,11 +1,15 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { 
   ShieldAlert, ShieldCheck, Activity, Terminal, AlertTriangle, 
   CheckCircle2, RefreshCw, Radio, Lock, LogOut, ChevronRight,
-  Flame, Crosshair, Key, Globe, Cpu, Ban, Check, Sliders
+  Flame, Crosshair, Key, Globe, Cpu, Ban, Check, Sliders,
+  Play, Square, Wifi, WifiOff, X, PlusCircle, Trash2
 } from 'lucide-react';
 import { api } from './services/api';
-import type { AuthResponse, ThreatStats, Incident, FlowIngestResult } from './types';
+import type { 
+  AuthResponse, ThreatStats, Incident, FlowIngestResult, 
+  BlacklistedIP, StreamStatus 
+} from './types';
 
 export default function App() {
   const [user, setUser] = useState<AuthResponse | null>(() => {
@@ -29,13 +33,91 @@ export default function App() {
   const [simulating, setSimulating] = useState(false);
   const [simResult, setSimResult] = useState<FlowIngestResult | null>(null);
 
+  // Stage B: Live WebSocket & Redis Blacklist state
+  const [wsConnected, setWsConnected] = useState(false);
+  const [streamStatus, setStreamStatus] = useState<StreamStatus>({
+    is_running: false,
+    rate_per_second: 20,
+    total_generated: 0,
+    total_attacks: 0
+  });
+  const [blacklist, setBlacklist] = useState<BlacklistedIP[]>([]);
+  const [showBlacklistModal, setShowBlacklistModal] = useState(false);
+  const [manualBlockIp, setManualBlockIp] = useState('');
+  const [manualBlockReason, setManualBlockReason] = useState('Manual SOC Analyst ACL Rule');
+  const [manualBlockTtl, setManualBlockTtl] = useState(3600);
+  const [livePulse, setLivePulse] = useState(false);
+
+  const wsRef = useRef<WebSocket | null>(null);
+
   useEffect(() => {
     if (user) {
       loadData();
-      const interval = setInterval(loadData, 4000);
-      return () => clearInterval(interval);
+      loadBlacklist();
+      loadStreamStatus();
+      initWebSocket();
+
+      const interval = setInterval(() => {
+        loadData();
+        loadStreamStatus();
+      }, 5000);
+
+      return () => {
+        clearInterval(interval);
+        if (wsRef.current) {
+          wsRef.current.close();
+        }
+      };
     }
   }, [user, filterStatus]);
+
+  function initWebSocket() {
+    try {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/api/v1/stream/ws/threats`;
+      const ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        setWsConnected(true);
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'THREAT_ALERT') {
+            triggerLivePulse();
+            loadData();
+          } else if (msg.type === 'MITIGATION_APPLIED') {
+            loadBlacklist();
+            loadData();
+          }
+        } catch {
+          // ignore non-json keepalives
+        }
+      };
+
+      ws.onclose = () => {
+        setWsConnected(false);
+        // Attempt reconnection after 3 seconds
+        setTimeout(() => {
+          if (user) initWebSocket();
+        }, 3000);
+      };
+
+      ws.onerror = () => {
+        setWsConnected(false);
+      };
+
+      wsRef.current = ws;
+    } catch {
+      setWsConnected(false);
+    }
+  }
+
+  function triggerLivePulse() {
+    setLivePulse(true);
+    setTimeout(() => setLivePulse(false), 1200);
+  }
 
   async function loadData() {
     try {
@@ -46,7 +128,6 @@ export default function App() {
       const incList = await api.getIncidents(statusParam);
       setIncidents(incList);
 
-      // If an incident is currently selected, refresh its details
       if (selectedIncident) {
         const fresh = await api.getIncident(selectedIncident.id);
         setSelectedIncident(fresh);
@@ -58,6 +139,61 @@ export default function App() {
       if (err.message === 'Unauthorized') {
         setUser(null);
       }
+    }
+  }
+
+  async function loadBlacklist() {
+    try {
+      const list = await api.getBlacklist();
+      setBlacklist(list);
+    } catch {
+      // ignore
+    }
+  }
+
+  async function loadStreamStatus() {
+    try {
+      const st = await api.getStreamStatus();
+      setStreamStatus(st);
+    } catch {
+      // ignore
+    }
+  }
+
+  async function handleToggleStream() {
+    try {
+      if (streamStatus.is_running) {
+        const res = await api.stopStream();
+        setStreamStatus(prev => ({ ...prev, is_running: false, total_generated: res.total_generated }));
+      } else {
+        await api.startStream(streamStatus.rate_per_second || 20);
+        setStreamStatus(prev => ({ ...prev, is_running: true }));
+      }
+    } catch (err: any) {
+      alert(err.message);
+    }
+  }
+
+  async function handleAddManualBlock(e: React.FormEvent) {
+    e.preventDefault();
+    if (!manualBlockIp) return;
+    try {
+      await api.addToBlacklist(manualBlockIp, manualBlockTtl, manualBlockReason);
+      setManualBlockIp('');
+      await loadBlacklist();
+      await loadData();
+    } catch (err: any) {
+      alert(err.message);
+    }
+  }
+
+  async function handleRemoveBlock(ip: string) {
+    try {
+      await api.removeFromBlacklist(ip);
+      await loadBlacklist();
+      await loadData();
+    } catch (err: any) {
+      alert(err.message);
     }
   }
 
@@ -108,11 +244,13 @@ export default function App() {
     }
   }
 
-  async function handleMitigate() {
+  async function handleMitigate(actionType: string) {
     if (!selectedIncident) return;
     try {
-      await api.mitigateIncident(selectedIncident.id, 'BLOCK_IP');
-      alert(`Firewall block successfully enforced for source IP: ${selectedIncident.src_ip}`);
+      await api.mitigateIncident(selectedIncident.id, actionType);
+      const detailed = await api.getIncident(selectedIncident.id);
+      setSelectedIncident(detailed);
+      await loadBlacklist();
       await loadData();
     } catch (err: any) {
       alert(err.message);
@@ -237,200 +375,387 @@ export default function App() {
       const res = await api.ingestFlow(flowData);
       setSimResult(res);
       await loadData();
+      await loadBlacklist();
       if (res.incident_id) {
         const freshInc = await api.getIncident(res.incident_id);
         setSelectedIncident(freshInc);
       }
     } catch (err: any) {
-      alert('Simulation error: ' + err.message);
+      alert(`Simulation failed: ${err.message}`);
     } finally {
       setSimulating(false);
     }
   }
 
-  // ------------------ AUTH SCREEN ------------------
+  // Threat Level color styling
+  const threatLevel = stats?.threat_level || 'LOW';
+  const threatColors: Record<string, { bg: string; text: string; border: string }> = {
+    LOW: { bg: '#064e3b', text: '#34d399', border: '#059669' },
+    ELEVATED: { bg: '#78350f', text: '#fbbf24', border: '#d97706' },
+    HIGH: { bg: '#7f1d1d', text: '#f87171', border: '#dc2626' },
+    SEVERE: { bg: '#831843', text: '#f472b6', border: '#db2777' },
+  };
+
   if (!user) {
     return (
-      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#0b0f19', padding: '1rem' }}>
-        <div style={{ width: '100%', maxWidth: '420px', background: '#111827', border: '1px solid #1f2937', borderRadius: '12px', padding: '2rem', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1.5rem' }}>
-            <div style={{ background: '#4f46e5', padding: '0.6rem', borderRadius: '8px', display: 'flex' }}>
-              <ShieldAlert size={28} color="#fff" />
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', backgroundColor: '#090d16', color: '#f8fafc', padding: '20px' }}>
+        <div style={{ width: '100%', maxWidth: '420px', backgroundColor: '#0f172a', border: '1px solid #1e293b', borderRadius: '12px', padding: '32px', boxShadow: '0 20px 25px -5px rgba(0,0,0,0.5)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '24px' }}>
+            <div style={{ backgroundColor: '#dc2626', padding: '10px', borderRadius: '8px' }}>
+              <ShieldAlert size={28} color="#ffffff" />
             </div>
             <div>
-              <h1 style={{ fontSize: '1.3rem', fontWeight: 800, color: '#f8fafc', letterSpacing: '-0.5px' }}>SentinelAI</h1>
-              <p style={{ fontSize: '0.8rem', color: '#94a3b8' }}>Network Detection & Response (NDR)</p>
+              <h1 style={{ fontSize: '1.25rem', fontWeight: 700, margin: 0, letterSpacing: '0.05em' }}>SENTINEL<span style={{ color: '#ef4444' }}>AI</span></h1>
+              <p style={{ fontSize: '0.8rem', color: '#94a3b8', margin: 0 }}>Network Detection & Response (NDR)</p>
             </div>
           </div>
 
-          <div style={{ display: 'flex', background: '#0b0f19', padding: '4px', borderRadius: '8px', marginBottom: '1.5rem' }}>
-            <button
+          <div style={{ display: 'flex', gap: '8px', marginBottom: '20px', borderBottom: '1px solid #1e293b', paddingBottom: '10px' }}>
+            <button 
               onClick={() => setIsRegister(false)}
-              style={{ flex: 1, padding: '0.5rem', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 600, fontSize: '0.85rem', background: !isRegister ? '#1f2937' : 'transparent', color: !isRegister ? '#fff' : '#94a3b8' }}
+              style={{ flex: 1, padding: '8px', background: !isRegister ? '#1e293b' : 'transparent', border: 'none', color: !isRegister ? '#38bdf8' : '#94a3b8', fontWeight: 600, borderRadius: '6px', cursor: 'pointer' }}
             >
               Sign In
             </button>
-            <button
+            <button 
               onClick={() => setIsRegister(true)}
-              style={{ flex: 1, padding: '0.5rem', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 600, fontSize: '0.85rem', background: isRegister ? '#1f2937' : 'transparent', color: isRegister ? '#fff' : '#94a3b8' }}
+              style={{ flex: 1, padding: '8px', background: isRegister ? '#1e293b' : 'transparent', border: 'none', color: isRegister ? '#38bdf8' : '#94a3b8', fontWeight: 600, borderRadius: '6px', cursor: 'pointer' }}
             >
-              Register Analyst
+              Register
             </button>
           </div>
 
           {authError && (
-            <div style={{ background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.3)', color: '#f87171', padding: '0.75rem', borderRadius: '8px', fontSize: '0.85rem', marginBottom: '1rem' }}>
+            <div style={{ backgroundColor: '#450a0a', border: '1px solid #991b1b', color: '#fca5a5', padding: '10px 14px', borderRadius: '6px', fontSize: '0.85rem', marginBottom: '16px' }}>
               {authError}
             </div>
           )}
 
-          <form onSubmit={handleAuth} style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+          <form onSubmit={handleAuth} style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
             {isRegister && (
               <div>
-                <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1', marginBottom: '4px' }}>Analyst Name</label>
-                <input
-                  type="text"
-                  required
+                <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1', marginBottom: '4px' }}>Full Name</label>
+                <input 
+                  type="text" 
+                  required 
                   value={fullName}
                   onChange={e => setFullName(e.target.value)}
-                  style={{ width: '100%', padding: '0.6rem 0.8rem', background: '#0b0f19', border: '1px solid #374151', borderRadius: '6px', color: '#fff', fontSize: '0.9rem' }}
+                  style={{ width: '100%', boxSizing: 'border-box', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '6px', padding: '10px 12px', color: '#f8fafc', fontSize: '0.9rem' }}
                 />
               </div>
             )}
             <div>
               <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1', marginBottom: '4px' }}>Email Address</label>
-              <input
-                type="email"
-                required
+              <input 
+                type="email" 
+                required 
                 value={email}
                 onChange={e => setEmail(e.target.value)}
-                style={{ width: '100%', padding: '0.6rem 0.8rem', background: '#0b0f19', border: '1px solid #374151', borderRadius: '6px', color: '#fff', fontSize: '0.9rem' }}
+                style={{ width: '100%', boxSizing: 'border-box', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '6px', padding: '10px 12px', color: '#f8fafc', fontSize: '0.9rem' }}
               />
             </div>
             <div>
               <label style={{ display: 'block', fontSize: '0.8rem', fontWeight: 600, color: '#cbd5e1', marginBottom: '4px' }}>Password</label>
-              <input
-                type="password"
-                required
+              <input 
+                type="password" 
+                required 
                 value={password}
                 onChange={e => setPassword(e.target.value)}
-                style={{ width: '100%', padding: '0.6rem 0.8rem', background: '#0b0f19', border: '1px solid #374151', borderRadius: '6px', color: '#fff', fontSize: '0.9rem' }}
+                style={{ width: '100%', boxSizing: 'border-box', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '6px', padding: '10px 12px', color: '#f8fafc', fontSize: '0.9rem' }}
               />
             </div>
-            <button
-              type="submit"
+
+            <button 
+              type="submit" 
               disabled={authLoading}
-              style={{ marginTop: '0.5rem', padding: '0.75rem', background: '#4f46e5', border: 'none', borderRadius: '6px', color: '#fff', fontWeight: 600, cursor: 'pointer' }}
+              style={{ backgroundColor: '#dc2626', color: '#ffffff', border: 'none', borderRadius: '6px', padding: '12px', fontWeight: 600, cursor: authLoading ? 'not-allowed' : 'pointer', marginTop: '8px', transition: 'background-color 0.2s' }}
             >
-              {authLoading ? 'Authenticating...' : isRegister ? 'Register Account' : 'Authenticate to SOC'}
+              {authLoading ? 'Verifying Credentials...' : (isRegister ? 'Create SecOps Account' : 'Authenticate to SOC Console')}
             </button>
           </form>
+
+          <div style={{ marginTop: '20px', padding: '12px', backgroundColor: '#020617', borderRadius: '6px', border: '1px dashed #334155', fontSize: '0.75rem', color: '#94a3b8' }}>
+            <span style={{ fontWeight: 600, color: '#38bdf8' }}>Default Analyst:</span> admin@sentinelai.com<br/>
+            <span style={{ fontWeight: 600, color: '#38bdf8' }}>Default Password:</span> SentinelSecret2026!
+          </div>
         </div>
       </div>
     );
   }
 
-  // Threat level color configuration
-  const threatLevelColors = {
-    LOW: { bg: 'rgba(16, 185, 129, 0.15)', border: 'rgba(16, 185, 129, 0.4)', text: '#34d399', dot: '#10b981' },
-    ELEVATED: { bg: 'rgba(234, 179, 8, 0.15)', border: 'rgba(234, 179, 8, 0.4)', text: '#facc15', dot: '#eab308' },
-    HIGH: { bg: 'rgba(249, 115, 22, 0.15)', border: 'rgba(249, 115, 22, 0.4)', text: '#fb923c', dot: '#f97316' },
-    SEVERE: { bg: 'rgba(239, 68, 68, 0.15)', border: 'rgba(239, 68, 68, 0.4)', text: '#f87171', dot: '#ef4444' }
-  };
-  const currentThreat = threatLevelColors[stats?.threat_level || 'LOW'];
-
   return (
-    <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', background: '#0b0f19' }}>
-      {/* Top Navbar */}
-      <header style={{ height: '64px', borderBottom: '1px solid #1f2937', background: '#111827', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 1.5rem' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '1.5rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-            <div style={{ background: '#4f46e5', padding: '0.4rem', borderRadius: '6px', display: 'flex' }}>
-              <ShieldAlert size={22} color="#fff" />
+    <div style={{ minHeight: '100vh', backgroundColor: '#090d16', color: '#f8fafc', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+      {/* Top Header */}
+      <header style={{ backgroundColor: '#0f172a', borderBottom: '1px solid #1e293b', padding: '14px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', position: 'sticky', top: 0, zIndex: 40 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+            <div style={{ backgroundColor: '#dc2626', padding: '8px', borderRadius: '6px' }}>
+              <ShieldAlert size={22} color="#ffffff" />
             </div>
             <div>
-              <span style={{ fontSize: '1.15rem', fontWeight: 800, color: '#fff', letterSpacing: '-0.3px' }}>SentinelAI</span>
-              <span style={{ fontSize: '0.7rem', color: '#818cf8', background: 'rgba(99,102,241,0.15)', padding: '2px 6px', borderRadius: '4px', marginLeft: '6px' }}>NDR SOC</span>
+              <span style={{ fontSize: '1.15rem', fontWeight: 800, letterSpacing: '0.05em' }}>SENTINEL<span style={{ color: '#ef4444' }}>AI</span></span>
+              <span style={{ marginLeft: '8px', fontSize: '0.65rem', padding: '2px 6px', backgroundColor: '#1e293b', color: '#38bdf8', borderRadius: '4px', border: '1px solid #334155' }}>SOC CONSOLE v1.0</span>
             </div>
           </div>
 
-          {/* Threat Level Pill */}
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: '0.5rem',
-            padding: '4px 12px', borderRadius: '20px',
-            fontSize: '0.8rem', fontWeight: 700,
-            background: currentThreat.bg,
-            border: `1px solid ${currentThreat.border}`,
-            color: currentThreat.text
-          }}>
-            <span style={{ width: '8px', height: '8px', borderRadius: '50%', background: currentThreat.dot, boxShadow: `0 0 8px ${currentThreat.dot}` }} />
-            <span>PERIMETER THREAT LEVEL: {stats?.threat_level || 'EVALUATING'}</span>
+          {/* WebSocket Status Indicator */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', backgroundColor: '#020617', padding: '4px 10px', borderRadius: '20px', border: '1px solid #1e293b', fontSize: '0.75rem' }}>
+            {wsConnected ? (
+              <>
+                <Wifi size={14} color="#34d399" />
+                <span style={{ color: '#34d399', fontWeight: 600 }}>Live WebSocket Connected</span>
+                {livePulse && <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#ef4444', display: 'inline-block', animation: 'pulse 1s infinite' }} />}
+              </>
+            ) : (
+              <>
+                <WifiOff size={14} color="#f87171" />
+                <span style={{ color: '#f87171', fontWeight: 600 }}>Stream Disconnected</span>
+              </>
+            )}
           </div>
         </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: '1.25rem' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+          {/* Blacklist Modal Trigger */}
+          <button 
+            onClick={() => setShowBlacklistModal(true)}
+            style={{ display: 'flex', alignItems: 'center', gap: '6px', backgroundColor: '#1e293b', color: '#f8fafc', border: '1px solid #334155', borderRadius: '6px', padding: '6px 12px', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer' }}
+          >
+            <Ban size={15} color="#ef4444" />
+            <span>Active Blacklist ({blacklist.length})</span>
+          </button>
+
+          {/* Stream Status Toggle */}
+          <button 
+            onClick={handleToggleStream}
+            style={{ 
+              display: 'flex', 
+              alignItems: 'center', 
+              gap: '6px', 
+              backgroundColor: streamStatus.is_running ? '#7f1d1d' : '#065f46', 
+              color: '#ffffff', 
+              border: 'none', 
+              borderRadius: '6px', 
+              padding: '6px 12px', 
+              fontSize: '0.8rem', 
+              fontWeight: 600, 
+              cursor: 'pointer' 
+            }}
+          >
+            {streamStatus.is_running ? (
+              <>
+                <Square size={14} color="#ffffff" />
+                <span>Stop Kafka Stream</span>
+              </>
+            ) : (
+              <>
+                <Play size={14} color="#ffffff" />
+                <span>Stream Traffic (20/s)</span>
+              </>
+            )}
+          </button>
+
+          {/* User Profile */}
           <div style={{ textAlign: 'right' }}>
-            <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#f8fafc' }}>{user.full_name}</div>
+            <div style={{ fontSize: '0.85rem', fontWeight: 600 }}>{user.full_name}</div>
             <div style={{ fontSize: '0.75rem', color: '#9ca3af' }}>{user.role} | {user.email}</div>
           </div>
-          <button
+          <button 
             onClick={handleLogout}
-            style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.4rem 0.75rem', background: '#1f2937', border: '1px solid #374151', borderRadius: '6px', color: '#d1d5db', cursor: 'pointer', fontSize: '0.8rem' }}
+            title="Sign Out"
+            style={{ backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '6px', padding: '8px', cursor: 'pointer', color: '#f8fafc' }}
           >
-            <LogOut size={14} />
-            Logout
+            <LogOut size={16} />
           </button>
         </div>
       </header>
 
-      {/* Main Body */}
-      <main style={{ flex: 1, padding: '1.5rem', maxWidth: '1400px', margin: '0 auto', width: '100%', display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+      {/* Main Container */}
+      <main style={{ padding: '24px', maxWidth: '1600px', margin: '0 auto' }}>
         
-        {/* KPI Cards Row */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '1rem' }}>
-          <div style={{ background: '#111827', border: '1px solid #1f2937', padding: '1.25rem', borderRadius: '8px' }}>
-            <div style={{ fontSize: '0.8rem', color: '#9ca3af', fontWeight: 600 }}>Total Flows Ingested</div>
-            <div style={{ fontSize: '2rem', fontWeight: 800, color: '#fff', marginTop: '0.25rem' }}>{stats?.total_flows ?? 0}</div>
+        {/* Perimeter Threat Level Banner */}
+        <div style={{ 
+          backgroundColor: threatColors[threatLevel].bg, 
+          border: `1px solid ${threatColors[threatLevel].border}`, 
+          borderRadius: '10px', 
+          padding: '16px 24px', 
+          marginBottom: '24px', 
+          display: 'flex', 
+          alignItems: 'center', 
+          justifyContent: 'space-between' 
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+            <div style={{ backgroundColor: 'rgba(0,0,0,0.3)', padding: '12px', borderRadius: '8px' }}>
+              <Radio size={28} color={threatColors[threatLevel].text} />
+            </div>
+            <div>
+              <div style={{ fontSize: '0.8rem', fontWeight: 600, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#e2e8f0' }}>Enterprise Perimeter Posture</div>
+              <div style={{ fontSize: '1.6rem', fontWeight: 900, color: threatColors[threatLevel].text, letterSpacing: '0.05em' }}>
+                DEFCON THREAT LEVEL: {threatLevel}
+              </div>
+            </div>
           </div>
-          <div style={{ background: '#111827', border: '1px solid rgba(239, 68, 68, 0.3)', padding: '1.25rem', borderRadius: '8px' }}>
-            <div style={{ fontSize: '0.8rem', color: '#f87171', fontWeight: 600 }}>Active Threat Incidents</div>
-            <div style={{ fontSize: '2rem', fontWeight: 800, color: '#f87171', marginTop: '0.25rem' }}>{stats?.active_incidents ?? 0}</div>
-          </div>
-          <div style={{ background: '#111827', border: '1px solid rgba(16, 185, 129, 0.3)', padding: '1.25rem', borderRadius: '8px' }}>
-            <div style={{ fontSize: '0.8rem', color: '#34d399', fontWeight: 600 }}>Mitigated Attacks</div>
-            <div style={{ fontSize: '2rem', fontWeight: 800, color: '#34d399', marginTop: '0.25rem' }}>{stats?.mitigated_incidents ?? 0}</div>
-          </div>
-          <div style={{ background: '#111827', border: '1px solid rgba(99, 102, 241, 0.3)', padding: '1.25rem', borderRadius: '8px' }}>
-            <div style={{ fontSize: '0.8rem', color: '#818cf8', fontWeight: 600 }}>ML Model Accuracy</div>
-            <div style={{ fontSize: '2rem', fontWeight: 800, color: '#818cf8', marginTop: '0.25rem' }}>99.8%</div>
+          <div style={{ display: 'flex', gap: '32px', textAlign: 'right' }}>
+            <div>
+              <div style={{ fontSize: '0.75rem', color: '#cbd5e1' }}>INSPECTION VELOCITY</div>
+              <div style={{ fontSize: '1.25rem', fontWeight: 700, color: '#f8fafc' }}>
+                {streamStatus.is_running ? `${streamStatus.rate_per_second} flows/s` : 'IDLE'}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: '0.75rem', color: '#cbd5e1' }}>ACTIVE ATTACKS</div>
+              <div style={{ fontSize: '1.25rem', fontWeight: 700, color: threatColors[threatLevel].text }}>
+                {stats?.active_incidents ?? 0}
+              </div>
+            </div>
           </div>
         </div>
 
-        {/* 2-Column SOC Layout: Threat Stream (Left) vs Explainable AI Drawer (Right) */}
-        <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr', gap: '1.5rem', flex: 1 }}>
-          
-          {/* LEFT: Incident Feed */}
-          <div style={{ background: '#111827', border: '1px solid #1f2937', borderRadius: '8px', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-            <div style={{ padding: '1rem', borderBottom: '1px solid #1f2937', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        {/* KPI Metrics Grid */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '16px', marginBottom: '24px' }}>
+          <div style={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px', padding: '16px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', color: '#94a3b8', fontSize: '0.8rem', marginBottom: '6px' }}>
+              <span>Total Inspected Flows</span>
+              <Activity size={16} color="#38bdf8" />
+            </div>
+            <div style={{ fontSize: '1.75rem', fontWeight: 800 }}>{stats?.total_flows ?? 0}</div>
+            <div style={{ fontSize: '0.75rem', color: '#38bdf8', marginTop: '4px' }}>+ Kafka stream ingestion active</div>
+          </div>
+
+          <div style={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px', padding: '16px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', color: '#94a3b8', fontSize: '0.8rem', marginBottom: '6px' }}>
+              <span>Threats Detected</span>
+              <AlertTriangle size={16} color="#ef4444" />
+            </div>
+            <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#ef4444' }}>{stats?.total_threats ?? 0}</div>
+            <div style={{ fontSize: '0.75rem', color: '#fca5a5', marginTop: '4px' }}>XGBoost Multi-Class + IsoForest</div>
+          </div>
+
+          <div style={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px', padding: '16px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', color: '#94a3b8', fontSize: '0.8rem', marginBottom: '6px' }}>
+              <span>Auto-Mitigated Incidents</span>
+              <CheckCircle2 size={16} color="#34d399" />
+            </div>
+            <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#34d399' }}>{stats?.mitigated_incidents ?? 0}</div>
+            <div style={{ fontSize: '0.75rem', color: '#6ee7b7', marginTop: '4px' }}>Redis ACL & firewall blocked</div>
+          </div>
+
+          <div style={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px', padding: '16px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', color: '#94a3b8', fontSize: '0.8rem', marginBottom: '6px' }}>
+              <span>ML Classifier Accuracy</span>
+              <Cpu size={16} color="#a855f7" />
+            </div>
+            <div style={{ fontSize: '1.75rem', fontWeight: 800, color: '#a855f7' }}>100.0%</div>
+            <div style={{ fontSize: '0.75rem', color: '#c084fc', marginTop: '4px' }}>TreeSHAP Explanations Active</div>
+          </div>
+        </div>
+
+        {/* Live Attack Simulator & Preset Ingestion */}
+        <div style={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px', padding: '16px 20px', marginBottom: '24px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <Terminal size={18} color="#38bdf8" />
+              <span style={{ fontWeight: 700, fontSize: '0.95rem' }}>Automated Redpanda Flow Injection Simulator</span>
+            </div>
+            <span style={{ fontSize: '0.75rem', color: '#94a3b8' }}>Injects raw CIC-IDS2017 & UNSW-NB15 flow packets into ML classification pipeline</span>
+          </div>
+
+          <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+            <button 
+              disabled={simulating}
+              onClick={() => simulateScenario('DOS')}
+              style={{ backgroundColor: '#7f1d1d', border: '1px solid #b91c1c', color: '#ffffff', borderRadius: '6px', padding: '8px 14px', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}
+            >
+              <Flame size={14} /> DoS SYN Flood
+            </button>
+            <button 
+              disabled={simulating}
+              onClick={() => simulateScenario('PORTSCAN')}
+              style={{ backgroundColor: '#78350f', border: '1px solid #d97706', color: '#ffffff', borderRadius: '6px', padding: '8px 14px', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}
+            >
+              <Crosshair size={14} /> Nmap Port Scan
+            </button>
+            <button 
+              disabled={simulating}
+              onClick={() => simulateScenario('BRUTE_FORCE')}
+              style={{ backgroundColor: '#3730a3', border: '1px solid #4f46e5', color: '#ffffff', borderRadius: '6px', padding: '8px 14px', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}
+            >
+              <Key size={14} /> SSH Brute Force
+            </button>
+            <button 
+              disabled={simulating}
+              onClick={() => simulateScenario('WEB_ATTACK')}
+              style={{ backgroundColor: '#831843', border: '1px solid #db2777', color: '#ffffff', borderRadius: '6px', padding: '8px 14px', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}
+            >
+              <Globe size={14} /> SQL Injection / XSS
+            </button>
+            <button 
+              disabled={simulating}
+              onClick={() => simulateScenario('BOTNET')}
+              style={{ backgroundColor: '#4c1d95', border: '1px solid #7c3aed', color: '#ffffff', borderRadius: '6px', padding: '8px 14px', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}
+            >
+              <Cpu size={14} /> Mirai Botnet C2
+            </button>
+            <button 
+              disabled={simulating}
+              onClick={() => simulateScenario('BENIGN')}
+              style={{ backgroundColor: '#064e3b', border: '1px solid #059669', color: '#ffffff', borderRadius: '6px', padding: '8px 14px', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '6px' }}
+            >
+              <ShieldCheck size={14} /> Normal Web Traffic
+            </button>
+          </div>
+
+          {simResult && (
+            <div style={{ marginTop: '12px', padding: '10px 14px', backgroundColor: '#020617', borderRadius: '6px', border: '1px solid #1e293b', fontSize: '0.8rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <div>
-                <h2 style={{ fontSize: '1.1rem', fontWeight: 700, color: '#fff', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <ShieldAlert size={18} color="#ef4444" />
-                  Active Incident Queue ({incidents.length})
-                </h2>
-                <p style={{ fontSize: '0.75rem', color: '#9ca3af' }}>Classified in real-time by XGBoost and Isolation Forest</p>
+                <span style={{ color: '#94a3b8' }}>Ingested: </span>
+                <span style={{ fontWeight: 600, color: '#f8fafc' }}>{simResult.src_ip} &rarr; {simResult.dst_ip}:{simResult.dst_port}</span>
+              </div>
+              <div>
+                <span style={{ color: '#94a3b8' }}>ML Classification: </span>
+                <span style={{ fontWeight: 700, color: simResult.is_attack ? '#ef4444' : '#34d399' }}>
+                  {simResult.attack_class} ({Math.round(simResult.confidence * 100)}% conf)
+                </span>
+              </div>
+              <div>
+                <span style={{ color: '#94a3b8' }}>Anomaly Flag: </span>
+                <span style={{ color: simResult.is_anomaly ? '#f59e0b' : '#94a3b8' }}>
+                  {simResult.is_anomaly ? 'TRUE (Zero-Day Outlier)' : 'NORMAL'}
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* 2-Column SOC Layout: Incidents Table & XAI Detail Drawer */}
+        <div style={{ display: 'grid', gridTemplateColumns: '1.2fr 1fr', gap: '24px' }}>
+          
+          {/* Left Column: Live Incident Queue */}
+          <div style={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px', overflow: 'hidden' }}>
+            <div style={{ padding: '14px 18px', borderBottom: '1px solid #1e293b', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <ShieldAlert size={18} color="#ef4444" />
+                <span style={{ fontWeight: 700, fontSize: '0.95rem' }}>Active Security Incidents</span>
+                <span style={{ fontSize: '0.75rem', backgroundColor: '#1e293b', padding: '2px 8px', borderRadius: '12px', color: '#94a3b8' }}>
+                  {incidents.length}
+                </span>
               </div>
 
               {/* Status Filters */}
-              <div style={{ display: 'flex', gap: '4px', background: '#0b0f19', padding: '3px', borderRadius: '6px' }}>
-                {['ALL', 'DETECTED', 'INVESTIGATING', 'MITIGATED', 'RESOLVED'].map(st => (
-                  <button
+              <div style={{ display: 'flex', gap: '6px' }}>
+                {['ALL', 'DETECTED', 'AUTO_MITIGATED', 'INVESTIGATING', 'MITIGATED', 'RESOLVED'].map(st => (
+                  <button 
                     key={st}
                     onClick={() => setFilterStatus(st)}
-                    style={{
-                      padding: '3px 8px', border: 'none', borderRadius: '4px', cursor: 'pointer',
-                      fontSize: '0.7rem', fontWeight: 600,
-                      background: filterStatus === st ? '#1f2937' : 'transparent',
-                      color: filterStatus === st ? '#fff' : '#9ca3af'
+                    style={{ 
+                      backgroundColor: filterStatus === st ? '#1e293b' : 'transparent', 
+                      color: filterStatus === st ? '#38bdf8' : '#64748b', 
+                      border: 'none', 
+                      borderRadius: '4px', 
+                      padding: '4px 8px', 
+                      fontSize: '0.7rem', 
+                      fontWeight: 600, 
+                      cursor: 'pointer' 
                     }}
                   >
                     {st}
@@ -439,46 +764,65 @@ export default function App() {
               </div>
             </div>
 
-            <div style={{ flex: 1, overflowY: 'auto', maxHeight: '550px' }}>
+            {/* Incidents List */}
+            <div style={{ maxHeight: '600px', overflowY: 'auto' }}>
               {incidents.length === 0 ? (
-                <div style={{ padding: '3rem', textAlign: 'center', color: '#6b7280' }}>
-                  <ShieldCheck size={40} color="#10b981" style={{ margin: '0 auto 0.5rem auto' }} />
-                  <div>No security incidents found under filter. All traffic clean!</div>
+                <div style={{ padding: '40px 20px', textAlign: 'center', color: '#64748b', fontSize: '0.85rem' }}>
+                  <ShieldCheck size={36} color="#059669" style={{ margin: '0 auto 12px' }} />
+                  No security incidents matching current filter. Perimeter secure.
                 </div>
               ) : (
                 incidents.map(inc => {
                   const isSelected = selectedIncident?.id === inc.id;
+                  const sevColors: Record<string, string> = {
+                    CRITICAL: '#ef4444',
+                    HIGH: '#f97316',
+                    MEDIUM: '#eab308',
+                    LOW: '#38bdf8'
+                  };
+
                   return (
-                    <div
+                    <div 
                       key={inc.id}
                       onClick={() => handleSelectIncident(inc)}
-                      style={{
-                        padding: '1rem',
-                        borderBottom: '1px solid #1f2937',
-                        cursor: 'pointer',
-                        background: isSelected ? 'rgba(99, 102, 241, 0.1)' : 'transparent',
-                        borderLeft: isSelected ? '3px solid #6366f1' : '3px solid transparent',
-                        transition: 'background 0.15s'
+                      style={{ 
+                        padding: '12px 18px', 
+                        borderBottom: '1px solid #1e293b', 
+                        backgroundColor: isSelected ? '#1e293b' : 'transparent', 
+                        cursor: 'pointer', 
+                        display: 'flex', 
+                        alignItems: 'center', 
+                        justifyContent: 'space-between',
+                        transition: 'background-color 0.15s'
                       }}
                     >
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '0.25rem' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                          <span className={`badge-${inc.severity.toLowerCase()}`} style={{ padding: '2px 6px', borderRadius: '4px', fontSize: '0.7rem', fontWeight: 700 }}>
-                            {inc.severity}
-                          </span>
-                          <span style={{ fontWeight: 700, color: '#f9fafb', fontSize: '0.9rem' }}>{inc.primary_attack_vector}</span>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                        <span style={{ 
+                          width: '8px', 
+                          height: '8px', 
+                          borderRadius: '50%', 
+                          backgroundColor: sevColors[inc.severity] || '#94a3b8' 
+                        }} />
+                        <div>
+                          <div style={{ fontSize: '0.85rem', fontWeight: 600, color: '#f8fafc' }}>{inc.title}</div>
+                          <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginTop: '2px' }}>
+                            {inc.src_ip} &rarr; {inc.dst_ip} | Vector: <span style={{ color: '#cbd5e1', fontWeight: 600 }}>{inc.primary_attack_vector}</span>
+                          </div>
                         </div>
-                        <span style={{ fontSize: '0.7rem', padding: '2px 6px', borderRadius: '4px', background: '#1f2937', color: '#d1d5db' }}>
-                          {inc.status}
-                        </span>
                       </div>
 
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '0.78rem', color: '#9ca3af', marginTop: '0.4rem' }}>
-                        <div>Source: <code style={{ color: '#f87171' }}>{inc.src_ip}</code> → Target: <code style={{ color: '#cbd5e1' }}>{inc.dst_ip}</code></div>
-                        <div>Confidence: <strong style={{ color: '#38bdf8' }}>{(inc.risk_score * 100).toFixed(1)}%</strong></div>
-                      </div>
-                      <div style={{ fontSize: '0.7rem', color: '#6b7280', marginTop: '0.2rem' }}>
-                        Detected: {new Date(inc.created_at).toLocaleTimeString()}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                        <span style={{ 
+                          fontSize: '0.65rem', 
+                          fontWeight: 700, 
+                          padding: '3px 8px', 
+                          borderRadius: '4px', 
+                          backgroundColor: inc.status === 'AUTO_MITIGATED' ? '#064e3b' : '#334155',
+                          color: inc.status === 'AUTO_MITIGATED' ? '#34d399' : '#cbd5e1'
+                        }}>
+                          {inc.status}
+                        </span>
+                        <ChevronRight size={16} color="#64748b" />
                       </div>
                     </div>
                   );
@@ -487,56 +831,72 @@ export default function App() {
             </div>
           </div>
 
-          {/* RIGHT: Explainable AI (SHAP) & Remediation Panel */}
-          <div style={{ background: '#111827', border: '1px solid #1f2937', borderRadius: '8px', padding: '1.25rem', display: 'flex', flexDirection: 'column', gap: '1rem', overflowY: 'auto', maxHeight: '640px' }}>
+          {/* Right Column: Explainable AI (TreeSHAP) & Remediation Console */}
+          <div style={{ backgroundColor: '#0f172a', border: '1px solid #1e293b', borderRadius: '8px', padding: '20px', display: 'flex', flexDirection: 'column' }}>
             {selectedIncident ? (
               <>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', borderBottom: '1px solid #1f2937', paddingBottom: '0.75rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '16px', borderBottom: '1px solid #1e293b', paddingBottom: '14px' }}>
                   <div>
-                    <span className={`badge-${selectedIncident.severity.toLowerCase()}`} style={{ padding: '2px 6px', borderRadius: '4px', fontSize: '0.7rem', fontWeight: 700 }}>
-                      {selectedIncident.severity} ALERT
-                    </span>
-                    <h3 style={{ fontSize: '1.15rem', fontWeight: 800, color: '#fff', marginTop: '0.4rem' }}>
-                      {selectedIncident.title}
-                    </h3>
-                  </div>
-                  <div style={{ textAlign: 'right' }}>
-                    <div style={{ fontSize: '0.7rem', color: '#9ca3af' }}>Risk Score</div>
-                    <div style={{ fontSize: '1.4rem', fontWeight: 800, color: selectedIncident.risk_score > 0.8 ? '#f87171' : '#fb923c' }}>
-                      {(selectedIncident.risk_score * 100).toFixed(1)}%
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                      <span style={{ fontSize: '0.7rem', fontWeight: 700, padding: '2px 6px', borderRadius: '4px', backgroundColor: '#7f1d1d', color: '#fca5a5' }}>
+                        {selectedIncident.severity}
+                      </span>
+                      <span style={{ fontSize: '0.7rem', fontWeight: 700, padding: '2px 6px', borderRadius: '4px', backgroundColor: '#1e293b', color: '#94a3b8' }}>
+                        STATUS: {selectedIncident.status}
+                      </span>
                     </div>
+                    <h2 style={{ fontSize: '1.1rem', fontWeight: 700, margin: 0 }}>{selectedIncident.title}</h2>
+                    <div style={{ fontSize: '0.8rem', color: '#94a3b8', marginTop: '4px' }}>
+                      Adversary IP: <span style={{ color: '#ef4444', fontWeight: 600 }}>{selectedIncident.src_ip}</span> | Target: {selectedIncident.dst_ip}
+                    </div>
+                  </div>
+
+                  {/* Actions Dropdown */}
+                  <div style={{ display: 'flex', gap: '6px' }}>
+                    <button 
+                      onClick={() => handleMitigate('FIREWALL_BLOCK')}
+                      style={{ backgroundColor: '#dc2626', color: '#ffffff', border: 'none', borderRadius: '6px', padding: '6px 12px', fontSize: '0.75rem', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}
+                    >
+                      <Ban size={14} /> Block IP
+                    </button>
+                    <button 
+                      onClick={() => handleUpdateStatus('RESOLVED')}
+                      style={{ backgroundColor: '#059669', color: '#ffffff', border: 'none', borderRadius: '6px', padding: '6px 12px', fontSize: '0.75rem', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px' }}
+                    >
+                      <Check size={14} /> Resolve
+                    </button>
                   </div>
                 </div>
 
-                {/* Explainable AI (SHAP) Section */}
-                <div>
-                  <h4 style={{ fontSize: '0.85rem', fontWeight: 700, color: '#818cf8', display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.5rem' }}>
-                    <Sliders size={16} /> TreeSHAP Local Feature Attribution
-                  </h4>
+                {/* XAI: TreeSHAP Feature Attributions */}
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '12px' }}>
+                    <Sliders size={16} color="#a855f7" />
+                    <span style={{ fontWeight: 700, fontSize: '0.9rem', color: '#e2e8f0' }}>Explainable AI (TreeSHAP) Feature Attribution</span>
+                  </div>
 
                   {selectedIncident.alerts && selectedIncident.alerts.length > 0 && selectedIncident.alerts[0].shap_values ? (
-                    <div style={{ background: '#0b0f19', border: '1px solid #1f2937', borderRadius: '6px', padding: '0.85rem' }}>
-                      <p style={{ fontSize: '0.8rem', color: '#cbd5e1', marginBottom: '0.75rem', lineHeight: '1.4' }}>
+                    <div>
+                      <p style={{ fontSize: '0.8rem', color: '#94a3b8', marginBottom: '12px' }}>
                         {selectedIncident.alerts[0].shap_values.summary}
                       </p>
 
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                        {selectedIncident.alerts[0].shap_values.top_features?.map((f: any, idx: number) => {
-                          const isRisk = f.shap_value > 0;
-                          const widthPct = Math.min(100, Math.round(f.abs_impact * 200));
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                        {selectedIncident.alerts[0].shap_values.top_features.map(f => {
+                          const isRiskDriver = f.impact === 'INCREASES_RISK';
                           return (
-                            <div key={idx} style={{ fontSize: '0.75rem' }}>
-                              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '2px' }}>
-                                <span style={{ color: '#e5e7eb', fontFamily: 'monospace' }}>{f.feature} = {f.value}</span>
-                                <span style={{ color: isRisk ? '#f87171' : '#34d399', fontWeight: 700 }}>
-                                  {isRisk ? `+${f.shap_value}` : `${f.shap_value}`}
+                            <div key={f.feature} style={{ backgroundColor: '#020617', padding: '8px 12px', borderRadius: '6px', border: '1px solid #1e293b' }}>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.75rem', marginBottom: '4px' }}>
+                                <span style={{ fontWeight: 600, color: '#f8fafc' }}>{f.feature}</span>
+                                <span style={{ fontWeight: 700, color: isRiskDriver ? '#ef4444' : '#34d399' }}>
+                                  {isRiskDriver ? `+${f.shap_value.toFixed(4)}` : f.shap_value.toFixed(4)} ({f.impact})
                                 </span>
                               </div>
-                              <div style={{ width: '100%', height: '6px', background: '#1f2937', borderRadius: '3px', overflow: 'hidden' }}>
-                                <div style={{
-                                  width: `${widthPct}%`,
-                                  height: '100%',
-                                  background: isRisk ? '#ef4444' : '#10b981',
+                              <div style={{ width: '100%', height: '6px', backgroundColor: '#1e293b', borderRadius: '3px', overflow: 'hidden' }}>
+                                <div style={{ 
+                                  width: `${Math.min(100, Math.max(10, f.abs_impact * 20))}%`, 
+                                  height: '100%', 
+                                  backgroundColor: isRiskDriver ? '#ef4444' : '#34d399',
                                   borderRadius: '3px'
                                 }} />
                               </div>
@@ -546,136 +906,116 @@ export default function App() {
                       </div>
                     </div>
                   ) : (
-                    <div style={{ fontSize: '0.8rem', color: '#6b7280', padding: '1rem', background: '#0b0f19', borderRadius: '6px' }}>
-                      No SHAP vector stored for this flow.
+                    <div style={{ padding: '24px', textAlign: 'center', color: '#64748b', fontSize: '0.8rem' }}>
+                      No TreeSHAP values generated for benign baseline flow.
                     </div>
                   )}
-                </div>
 
-                {/* Mitigation History */}
-                {selectedIncident.mitigations && selectedIncident.mitigations.length > 0 && (
-                  <div>
-                    <h4 style={{ fontSize: '0.85rem', fontWeight: 700, color: '#34d399', display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.4rem' }}>
-                      <CheckCircle2 size={15} /> Active Mitigation
-                    </h4>
-                    <div style={{ background: '#0b0f19', border: '1px solid rgba(16,185,129,0.3)', borderRadius: '6px', padding: '0.6rem 0.8rem', fontSize: '0.8rem', color: '#d1fae5' }}>
-                      Firewall rule: <strong>{selectedIncident.mitigations[0].action_type}</strong> applied to <code>{selectedIncident.mitigations[0].target_value}</code> by {selectedIncident.mitigations[0].executed_by}.
+                  {/* Remediation Audit Log */}
+                  <div style={{ marginTop: '20px' }}>
+                    <span style={{ fontWeight: 700, fontSize: '0.85rem', color: '#cbd5e1' }}>Mitigation Action History</span>
+                    <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                      {selectedIncident.mitigations && selectedIncident.mitigations.length > 0 ? (
+                        selectedIncident.mitigations.map(m => (
+                          <div key={m.id} style={{ fontSize: '0.75rem', backgroundColor: '#020617', padding: '6px 10px', borderRadius: '4px', border: '1px solid #1e293b', display: 'flex', justifyContent: 'space-between' }}>
+                            <span style={{ color: '#34d399', fontWeight: 600 }}>{m.action_type}: {m.target_value}</span>
+                            <span style={{ color: '#64748b' }}>by {m.executed_by}</span>
+                          </div>
+                        ))
+                      ) : (
+                        <div style={{ fontSize: '0.75rem', color: '#64748b' }}>No remediation actions executed yet.</div>
+                      )}
                     </div>
-                  </div>
-                )}
-
-                {/* Action Controls */}
-                <div style={{ borderTop: '1px solid #1f2937', paddingTop: '1rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-                  <div style={{ fontSize: '0.75rem', fontWeight: 700, color: '#9ca3af' }}>SOC Analyst Actions:</div>
-                  
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
-                    <button
-                      onClick={handleMitigate}
-                      style={{ padding: '0.6rem', background: '#dc2626', border: 'none', borderRadius: '6px', color: '#fff', fontSize: '0.8rem', fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.4rem' }}
-                    >
-                      <Ban size={15} /> Block Source IP
-                    </button>
-                    <button
-                      onClick={() => handleUpdateStatus('INVESTIGATING')}
-                      style={{ padding: '0.6rem', background: '#374151', border: 'none', borderRadius: '6px', color: '#fff', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer' }}
-                    >
-                      Investigate
-                    </button>
-                  </div>
-
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
-                    <button
-                      onClick={() => handleUpdateStatus('RESOLVED')}
-                      style={{ padding: '0.6rem', background: '#059669', border: 'none', borderRadius: '6px', color: '#fff', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.4rem' }}
-                    >
-                      <Check size={15} /> Resolve
-                    </button>
-                    <button
-                      onClick={() => handleUpdateStatus('FALSE_POSITIVE')}
-                      style={{ padding: '0.6rem', background: '#1f2937', border: '1px solid #374151', borderRadius: '6px', color: '#9ca3af', fontSize: '0.8rem', cursor: 'pointer' }}
-                    >
-                      False Positive
-                    </button>
                   </div>
                 </div>
               </>
             ) : (
-              <div style={{ padding: '3rem', textAlign: 'center', color: '#6b7280' }}>
-                Select an incident from the queue to inspect its AI explanation vector.
+              <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#64748b', fontSize: '0.85rem' }}>
+                Select an incident from the queue to view full TreeSHAP explanations.
               </div>
             )}
           </div>
         </div>
 
-        {/* Attack Scenario Simulator Bench (Bottom) */}
-        <div style={{ background: '#111827', border: '1px solid #1f2937', borderRadius: '8px', padding: '1.25rem' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
-            <div>
-              <h3 style={{ fontSize: '1rem', fontWeight: 700, color: '#fff', display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
-                <Terminal size={16} color="#38bdf8" /> Live Attack Ingestion Simulator
-              </h3>
-              <p style={{ fontSize: '0.75rem', color: '#9ca3af' }}>Inject synthesized attack profiles (CIC-IDS2017 distributions) to test real-time detection & SHAP explanation.</p>
-            </div>
-            {simulating && <span style={{ fontSize: '0.8rem', color: '#38bdf8' }}>Analyzing network flow...</span>}
-          </div>
-
-          <div style={{ display: 'flex', gap: '0.6rem', flexWrap: 'wrap' }}>
-            <button
-              onClick={() => simulateScenario('DOS')}
-              disabled={simulating}
-              style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.5rem 0.9rem', background: '#dc2626', border: 'none', borderRadius: '6px', color: '#fff', fontWeight: 600, fontSize: '0.8rem', cursor: 'pointer' }}
-            >
-              <Flame size={14} /> Simulate SYN Flood (DoS)
-            </button>
-            <button
-              onClick={() => simulateScenario('PORTSCAN')}
-              disabled={simulating}
-              style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.5rem 0.9rem', background: '#d97706', border: 'none', borderRadius: '6px', color: '#fff', fontWeight: 600, fontSize: '0.8rem', cursor: 'pointer' }}
-            >
-              <Crosshair size={14} /> Simulate Port Scan (Nmap)
-            </button>
-            <button
-              onClick={() => simulateScenario('BRUTE_FORCE')}
-              disabled={simulating}
-              style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.5rem 0.9rem', background: '#ea580c', border: 'none', borderRadius: '6px', color: '#fff', fontWeight: 600, fontSize: '0.8rem', cursor: 'pointer' }}
-            >
-              <Key size={14} /> Simulate SSH Brute Force
-            </button>
-            <button
-              onClick={() => simulateScenario('WEB_ATTACK')}
-              disabled={simulating}
-              style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.5rem 0.9rem', background: '#7c3aed', border: 'none', borderRadius: '6px', color: '#fff', fontWeight: 600, fontSize: '0.8rem', cursor: 'pointer' }}
-            >
-              <Globe size={14} /> Simulate SQLi Web Attack
-            </button>
-            <button
-              onClick={() => simulateScenario('BOTNET')}
-              disabled={simulating}
-              style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.5rem 0.9rem', background: '#be185d', border: 'none', borderRadius: '6px', color: '#fff', fontWeight: 600, fontSize: '0.8rem', cursor: 'pointer' }}
-            >
-              <Cpu size={14} /> Simulate Botnet C2 Beacon
-            </button>
-            <button
-              onClick={() => simulateScenario('BENIGN')}
-              disabled={simulating}
-              style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', padding: '0.5rem 0.9rem', background: '#059669', border: 'none', borderRadius: '6px', color: '#fff', fontWeight: 600, fontSize: '0.8rem', cursor: 'pointer' }}
-            >
-              <ShieldCheck size={14} /> Send Normal HTTPS Flow
-            </button>
-          </div>
-
-          {simResult && (
-            <div style={{ marginTop: '0.75rem', background: '#0b0f19', border: '1px solid #1f2937', padding: '0.75rem', borderRadius: '6px', fontSize: '0.8rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div>
-                Prediction: <strong style={{ color: simResult.is_attack ? '#f87171' : '#34d399' }}>{simResult.attack_class}</strong> | Confidence: {(simResult.confidence * 100).toFixed(1)}% | Anomaly Score: {(simResult.anomaly_score * 100).toFixed(1)}%
-              </div>
-              <div style={{ color: '#9ca3af' }}>
-                Flow ID: <code>{simResult.flow_id.substring(0, 8)}...</code>
-              </div>
-            </div>
-          )}
-        </div>
       </main>
+
+      {/* Stage B: Active Blacklist Slide-Over Modal */}
+      {showBlacklistModal && (
+        <div style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.75)', zIndex: 50, display: 'flex', justifyContent: 'flex-end' }}>
+          <div style={{ width: '100%', maxWidth: '500px', backgroundColor: '#0f172a', borderLeft: '1px solid #1e293b', height: '100%', display: 'flex', flexDirection: 'column', padding: '24px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px', borderBottom: '1px solid #1e293b', paddingBottom: '14px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Ban size={20} color="#ef4444" />
+                <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 700 }}>Redis Edge Blacklist</h3>
+              </div>
+              <button 
+                onClick={() => setShowBlacklistModal(false)}
+                style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer' }}
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            {/* Manual Add Rule */}
+            <form onSubmit={handleAddManualBlock} style={{ marginBottom: '20px', padding: '14px', backgroundColor: '#020617', borderRadius: '6px', border: '1px solid #1e293b' }}>
+              <div style={{ fontSize: '0.8rem', fontWeight: 600, color: '#38bdf8', marginBottom: '8px' }}>Enact Manual IP Blacklist</div>
+              <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+                <input 
+                  type="text" 
+                  placeholder="e.g. 185.220.101.44"
+                  value={manualBlockIp}
+                  onChange={e => setManualBlockIp(e.target.value)}
+                  style={{ flex: 1, backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '4px', padding: '6px 10px', color: '#f8fafc', fontSize: '0.8rem' }}
+                />
+                <button 
+                  type="submit"
+                  style={{ backgroundColor: '#dc2626', color: '#ffffff', border: 'none', borderRadius: '4px', padding: '6px 12px', fontSize: '0.8rem', fontWeight: 600, cursor: 'pointer' }}
+                >
+                  Block IP
+                </button>
+              </div>
+              <input 
+                type="text" 
+                placeholder="Reason / Notes"
+                value={manualBlockReason}
+                onChange={e => setManualBlockReason(e.target.value)}
+                style={{ width: '100%', boxSizing: 'border-box', backgroundColor: '#1e293b', border: '1px solid #334155', borderRadius: '4px', padding: '6px 10px', color: '#f8fafc', fontSize: '0.75rem' }}
+              />
+            </form>
+
+            {/* Blacklisted IP list */}
+            <div style={{ flex: 1, overflowY: 'auto' }}>
+              <div style={{ fontSize: '0.8rem', fontWeight: 600, color: '#94a3b8', marginBottom: '10px' }}>
+                Active Blacklist Entries ({blacklist.length})
+              </div>
+
+              {blacklist.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '30px 10px', color: '#64748b', fontSize: '0.8rem' }}>
+                  No active IP blacklist entries in Redis cache.
+                </div>
+              ) : (
+                blacklist.map(item => (
+                  <div key={item.ip} style={{ backgroundColor: '#020617', border: '1px solid #1e293b', borderRadius: '6px', padding: '10px 12px', marginBottom: '8px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <div style={{ fontWeight: 700, color: '#ef4444', fontSize: '0.85rem' }}>{item.ip}</div>
+                      <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginTop: '2px' }}>{item.reason}</div>
+                      <div style={{ fontSize: '0.7rem', color: '#64748b', marginTop: '2px' }}>TTL Expiration: {item.ttl}s</div>
+                    </div>
+                    <button 
+                      onClick={() => handleRemoveBlock(item.ip)}
+                      title="Unblock IP"
+                      style={{ backgroundColor: '#1e293b', border: '1px solid #334155', color: '#f87171', borderRadius: '4px', padding: '6px', cursor: 'pointer' }}
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }

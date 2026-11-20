@@ -1,4 +1,4 @@
-import type { AuthResponse, ThreatStats, Incident, FlowIngestResult } from '../types';
+import type { AuthResponse, ThreatStats, Incident, FlowIngestResult, BlacklistedIP, StreamStatus } from '../types';
 
 const API_BASE = '/api/v1';
 
@@ -103,5 +103,54 @@ export const api = {
       body: JSON.stringify(flowData),
     });
     return handleResponse<FlowIngestResult>(res);
+  },
+
+  // Active Blacklist Management
+  async getBlacklist(): Promise<BlacklistedIP[]> {
+    const res = await fetch(`${API_BASE}/blacklist`, {
+      headers: getAuthHeaders(),
+    });
+    return handleResponse<BlacklistedIP[]>(res);
+  },
+
+  async addToBlacklist(ip: string, durationSeconds = 3600, reason = 'Manual SOC Block'): Promise<any> {
+    const res = await fetch(`${API_BASE}/blacklist`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ ip, duration_seconds: durationSeconds, reason }),
+    });
+    return handleResponse<any>(res);
+  },
+
+  async removeFromBlacklist(ip: string): Promise<any> {
+    const res = await fetch(`${API_BASE}/blacklist/${encodeURIComponent(ip)}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    return handleResponse<any>(res);
+  },
+
+  // Kafka Flow Stream Controls
+  async getStreamStatus(): Promise<StreamStatus> {
+    const res = await fetch(`${API_BASE}/stream/status`, {
+      headers: getAuthHeaders(),
+    });
+    return handleResponse<StreamStatus>(res);
+  },
+
+  async startStream(rate = 20): Promise<any> {
+    const res = await fetch(`${API_BASE}/stream/start?rate=${rate}`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+    });
+    return handleResponse<any>(res);
+  },
+
+  async stopStream(): Promise<any> {
+    const res = await fetch(`${API_BASE}/stream/stop`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+    });
+    return handleResponse<any>(res);
   },
 };

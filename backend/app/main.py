@@ -5,10 +5,14 @@ from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.database import engine, Base, AsyncSessionLocal
+from app.core.redis_client import close_redis_client
 from app.core.security import get_password_hash
 from app.models.user import User
 from app.api.router import api_router
 from app.ml.classifier import IntrusionClassifier
+from app.services.stream_producer import stream_producer
+from app.services.stream_consumer import stream_consumer
+from app.services.traffic_generator import traffic_generator
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -35,10 +39,24 @@ async def lifespan(app: FastAPI):
     classifier = IntrusionClassifier.get_instance()
     print(f"✓ SentinelAI ML Engine loaded with {len(classifier.class_names)} classes.")
 
+    # 4. Start Redpanda Producer & Consumer streaming workers
+    try:
+        await stream_producer.start()
+        await stream_consumer.start()
+        print("✓ Redpanda streaming pipeline active (Producer + Consumer worker).")
+    except Exception as e:
+        print(f"⚠ Warning: Could not connect to Kafka/Redpanda: {e}. Stream endpoints will retry.")
+
     yield
 
     # Shutdown
+    print("Initiating SentinelAI graceful shutdown...")
+    await traffic_generator.stop()
+    await stream_consumer.stop()
+    await stream_producer.stop()
+    await close_redis_client()
     await engine.dispose()
+    print("✓ All SentinelAI services safely stopped.")
 
 app = FastAPI(
     title="SentinelAI — Network Detection & Response Engine",
@@ -63,9 +81,6 @@ async def health_check():
         "status": "UP",
         "service": "SentinelAI NDR Engine",
         "version": settings.VERSION,
-        "ml_engine": "XGBoost + TreeSHAP Active"
+        "ml_engine": "XGBoost + TreeSHAP Active",
+        "streaming": "Redpanda / Kafka Active"
     }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)

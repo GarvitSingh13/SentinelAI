@@ -1,8 +1,11 @@
 import pytest_asyncio
 from sqlalchemy import select
+from httpx import AsyncClient, ASGITransport
+
 from app.core.database import engine, Base, AsyncSessionLocal
 from app.core.security import get_password_hash
 from app.models.user import User
+from app.main import app
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
 async def init_test_db():
@@ -26,3 +29,18 @@ async def init_test_db():
 
     yield
     await engine.dispose()
+
+@pytest_asyncio.fixture
+async def client():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+@pytest_asyncio.fixture
+async def admin_token_headers(client: AsyncClient):
+    res = await client.post("/api/v1/auth/login", json={
+        "email": "admin@sentinelai.com",
+        "password": "SentinelSecret2026!"
+    })
+    token = res.json()["access_token"]
+    return {"Authorization": f"Bearer {token}"}

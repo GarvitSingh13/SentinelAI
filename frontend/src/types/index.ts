@@ -84,3 +84,18 @@ export interface FlowIngestResult {
   incident_id?: string;
   shap_explanation?: ShapExplanation;
 }
+
+export interface BlacklistedIP {
+  ip: string;
+  reason: string;
+  attack_class: string;
+  blocked_at: number;
+  ttl: number;
+}
+
+export interface StreamStatus {
+  is_running: boolean;
+  rate_per_second: number;
+  total_generated: number;
+  total_attacks: number;
+}
