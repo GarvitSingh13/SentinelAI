@@ -9,6 +9,7 @@ from app.core.redis_client import close_redis_client
 from app.core.security import get_password_hash
 from app.models.user import User
 from app.api.router import api_router
+from app.api.v1.metrics import prometheus_metrics
 from app.ml.classifier import IntrusionClassifier
 from app.services.stream_producer import stream_producer
 from app.services.stream_consumer import stream_consumer
@@ -84,3 +85,7 @@ async def health_check():
         "ml_engine": "XGBoost + TreeSHAP Active",
         "streaming": "Redpanda / Kafka Active"
     }
+
+@app.get("/metrics", tags=["Prometheus Telemetry"])
+async def metrics_endpoint():
+    return await prometheus_metrics()

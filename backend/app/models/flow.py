@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Column, String, Integer, Float, DateTime
+from sqlalchemy import Column, String, Integer, Float, Boolean, DateTime
 from sqlalchemy.dialects.postgresql import UUID
 from app.core.database import Base
 
@@ -30,4 +30,11 @@ class NetworkFlow(Base):
     psh_flag_count = Column(Integer, default=0)
     ack_flag_count = Column(Integer, default=0)
     
+    attack_class = Column(String(50), default="BENIGN", nullable=False, index=True)
+    confidence = Column(Float, default=1.0, nullable=False)
+    is_attack = Column(Boolean, default=False, nullable=False, index=True)
+    is_anomaly = Column(Boolean, default=False, nullable=False)
+    anomaly_score = Column(Float, default=0.0, nullable=False)
+
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
     captured_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
