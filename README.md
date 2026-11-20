@@ -186,3 +186,8 @@ cd backend
 - `GET /api/v1/ml/drift`: Population Stability Index (PSI) drift report.
 - `GET /api/v1/ml/model-info`: Offline training metrics and feature importance.
 - `GET /metrics`: Standard Prometheus metrics export.
+
+---
+
+## 📜 License
+This project is licensed under the [MIT License](LICENSE). Created by [Garvit Singh](https://github.com/GarvitSingh13).
